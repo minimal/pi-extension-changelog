@@ -1,0 +1,427 @@
+#!/usr/bin/env node
+//
+// pi-extension-changelog - Show what changed in pending pi extension package updates.
+//
+// Reads the pi agent's installed npm packages (~/.pi/agent/npm by default),
+// compares each installed version against the latest on the npm registry, and
+// for outdated packages pulls release notes / commit diffs from GitHub via
+// `gh`. Meant to be run before `pi update --extensions` so you know what you
+// are about to install.
+//
+// Usage:
+//   pi-extension-changelog                    # all outdated packages
+//   pi-extension-changelog pi-web-access      # only these packages
+//   pi-extension-changelog --all              # include up-to-date packages
+//   pi-extension-changelog --full             # no truncation; notes AND commits
+//   pi-extension-changelog --json             # machine-readable output
+//   pi-extension-changelog --max-notes 2000   # cap release-note length
+//   pi-extension-changelog --agent-dir DIR    # override ~/.pi/agent
+//
+// Zero runtime dependencies: Node >= 18 (fetch) and `gh` on PATH.
+
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+// ---------------------------------------------------------------- config ----
+
+const argv = process.argv.slice(2);
+const only = [];
+const opts = {
+  all: false, // include up-to-date packages
+  full: false, // no truncation, show notes and commits
+  json: false, // machine-readable output
+  maxNotes: 5000, // release-body cap in chars
+  agentDir: null,
+};
+
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === "--all") opts.all = true;
+  else if (a === "--full") opts.full = true;
+  else if (a === "--json") opts.json = true;
+  else if (a === "--max-notes") opts.maxNotes = Number(argv[++i]);
+  else if (a === "--agent-dir") opts.agentDir = argv[++i];
+  else if (a.startsWith("-")) {
+    console.error(`unknown option: ${a}`);
+    process.exit(2);
+  } else only.push(a);
+}
+
+const agentDir = opts.agentDir || path.join(os.homedir(), ".pi", "agent");
+const npmRoot = path.join(agentDir, "npm");
+const NPM_REGISTRY = process.env.PI_EXTENSION_CHANGELOG_REGISTRY || "https://registry.npmjs.org";
+
+// -------------------------------------------------------------- helpers ----
+
+// Tiny semver compare. Handles major.minor.patch[-pre][+build]. Prerelease
+// sorts before its release. Build metadata is ignored.
+function parseSemver(v) {
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(
+    String(v).trim().replace(/^v/i, "")
+  );
+  if (!m) return null;
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+    pre: m[4] ? m[4].split(".") : [],
+  };
+}
+
+function cmpSemver(a, b) {
+  const A = parseSemver(a);
+  const B = parseSemver(b);
+  if (!A || !B) return 0; // unparseable: treat as equal
+  for (const k of ["major", "minor", "patch"]) {
+    if (A[k] !== B[k]) return A[k] < B[k] ? -1 : 1;
+  }
+  if (A.pre.length === 0 && B.pre.length === 0) return 0;
+  if (A.pre.length === 0) return 1; // 1.0.0 > 1.0.0-rc.1
+  if (B.pre.length === 0) return -1;
+  for (let i = 0; i < Math.max(A.pre.length, B.pre.length); i++) {
+    if (A.pre[i] === undefined) return -1;
+    if (B.pre[i] === undefined) return 1;
+    const x = A.pre[i];
+    const y = B.pre[i];
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) {
+      if (Number(x) !== Number(y)) return Number(x) < Number(y) ? -1 : 1;
+    } else if (xn !== yn) {
+      return xn ? -1 : 1; // numeric < alphanumeric
+    } else if (x !== y) {
+      return x < y ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+const gt = (a, b) => cmpSemver(a, b) > 0;
+const lte = (a, b) => cmpSemver(a, b) <= 0;
+
+function run(cmd, args) {
+  try {
+    return execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+  } catch (e) {
+    throw new Error(`\`${cmd} ${args.join(" ")}\` failed: ${(e.stderr || e.message || "").toString().trim()}`);
+  }
+}
+
+function ghApi(args) {
+  return run("gh", ["api", ...args]);
+}
+
+// Normalize a git tag to a bare semver string. Handles v2.6.0, 2.6.0,
+// rpiv-todo@2.6.0, @scope/pkg@2.6.0.
+function tagToVersion(tag) {
+  let t = String(tag).trim();
+  if (t.includes("@")) t = t.slice(t.lastIndexOf("@") + 1);
+  return t.replace(/^v/i, "");
+}
+
+function toDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toISOString().slice(0, 10);
+}
+
+function relDate(iso) {
+  if (!iso) return "";
+  const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+  if (days < 0) return "today";
+  if (days === 0) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 30) return `${days} days ago`;
+  if (days < 365) return `${Math.round(days / 30)} months ago`;
+  return `${Math.round(days / 365)} years ago`;
+}
+
+// --------------------------------------------------------- data sources ----
+
+function loadInstalled() {
+  const pkgFile = path.join(npmRoot, "package.json");
+  const deps = JSON.parse(fs.readFileSync(pkgFile, "utf8")).dependencies || {};
+  const out = [];
+  for (const name of Object.keys(deps)) {
+    const dir = path.join(npmRoot, "node_modules", name);
+    let installed = null;
+    try {
+      installed = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).version;
+    } catch {
+      /* not physically installed (yet) */
+    }
+    out.push({ name, declared: deps[name], installed });
+  }
+  return out;
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: { accept: "application/json" } });
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return res.json();
+}
+
+async function npmInfo(name) {
+  const url = `${NPM_REGISTRY}/${encodeURIComponent(name).replace(/%40/, "@").replace(/%2F/, "/")}`;
+  const doc = await fetchJson(url);
+  const latest = (doc["dist-tags"] && doc["dist-tags"].latest) || null;
+  const time = doc.time || {};
+  const repo = doc.repository;
+  const repoUrl =
+    typeof repo === "string" ? repo : repo && repo.url ? repo.url : null;
+  const versions = Object.keys(doc.versions || {});
+  return { name, latest, time, repoUrl, homepage: doc.homepage || "", versions };
+}
+
+function githubSlug(repoUrl) {
+  if (!repoUrl) return null;
+  const m = /github\.com[/:]([^/]+)\/([^/.#]+)/.exec(repoUrl);
+  return m ? { owner: m[1], repo: m[2].replace(/\.git$/, "") } : null;
+}
+
+function ghReleases(owner, repo) {
+  try {
+    return JSON.parse(ghApi([`repos/${owner}/${repo}/releases`, "--paginate", "-H", "Accept: application/vnd.github+json"]));
+  } catch {
+    return [];
+  }
+}
+
+function ghTags(owner, repo) {
+  try {
+    return JSON.parse(ghApi([`repos/${owner}/${repo}/tags`, "--paginate"]));
+  } catch {
+    return [];
+  }
+}
+
+function ghCompare(owner, repo, baseRef, headRef) {
+  return JSON.parse(
+    ghApi([`repos/${owner}/${repo}/compare/${baseRef}...${headRef}`, "-H", "Accept: application/vnd.github+json"])
+  );
+}
+
+// ------------------------------------------------------------- analysis ----
+
+// Pick the raw tag name (from the repo tag list) for a semver version.
+// Prefer an exact "v<version>" tag, then plain "<version>".
+function findTag(tags, version) {
+  const v = String(version);
+  const exact = tags.find((t) => t.name === `v${v}`);
+  if (exact) return exact.name;
+  const plain = tags.find((t) => t.name === v);
+  if (plain) return plain.name;
+  const norm = tags.find((t) => tagToVersion(t.name) === v);
+  return norm ? norm.name : null;
+}
+
+async function analyze(pkg, ctx) {
+  const { name, installed, declared } = pkg;
+  const res = { name, installed, declared, latest: null, outdated: false, error: null, repo: null, monorepo: false, versions: [], releases: [], commits: null, notes: "" };
+
+  if (!installed) {
+    res.error = "not installed (listed in package.json but no node_modules entry)";
+    return res;
+  }
+
+  let info;
+  try {
+    info = await npmInfo(name);
+  } catch (e) {
+    res.error = `npm registry: ${e.message}`;
+    return res;
+  }
+  res.latest = info.latest;
+  res.homepage = info.homepage;
+  res.outdated = !!info.latest && gt(info.latest, installed);
+  res.npmUrl = `https://www.npmjs.com/package/${name}`;
+
+  if (!res.outdated) return res; // up to date
+
+  const slug = githubSlug(info.repoUrl);
+  res.repo = slug ? `${slug.owner}/${slug.repo}` : null;
+  if (!slug) {
+    res.error = "no GitHub repository in npm metadata; check the npm page manually";
+    return res;
+  }
+  if (ctx.repoCount[res.repo] > 1) res.monorepo = true;
+
+  // Versions strictly between installed and latest (publish dates from npm).
+  for (const v of info.versions) {
+    if (gt(v, installed) && lte(v, info.latest)) {
+      res.versions.push({ version: v, published: info.time[v] || "" });
+    }
+  }
+  res.versions.sort((a, b) => cmpSemver(a.version, b.version));
+
+  // GitHub releases in range.
+  const releases = ghReleases(slug.owner, slug.repo);
+  const inRange = releases
+    .map((r) => ({ tag: r.tag_name, name: r.name, body: r.body || "", published: r.published_at }))
+    .filter((r) => {
+      const v = tagToVersion(r.tag);
+      return v && gt(v, installed) && lte(v, info.latest);
+    })
+    .sort((a, b) => cmpSemver(tagToVersion(a.tag), tagToVersion(b.tag)));
+  res.releases = inRange;
+
+  // Commit diff between tags, when release notes are missing or --full.
+  const needCommits = opts.full || inRange.every((r) => !r.body.trim());
+  if (needCommits) {
+    const tags = ghTags(slug.owner, slug.repo).map((t) => ({ name: t.name }));
+    const base = findTag(tags, installed);
+    const head = findTag(tags, info.latest);
+    if (base && head) {
+      try {
+        const cmp = ghCompare(slug.owner, slug.repo, base, head);
+        res.commits = {
+          base,
+          head,
+          ahead: cmp.ahead_by || 0,
+          subjects: (cmp.commits || []).map((c) => c.commit.message.split("\n")[0]).filter(Boolean),
+        };
+      } catch (e) {
+        res.commits = { base, head, ahead: 0, subjects: [], error: e.message };
+      }
+    }
+  }
+
+  // Prefer release notes for the summary; fall back to commit subjects.
+  const bodies = inRange.filter((r) => r.body.trim());
+  if (bodies.length) {
+    res.notes = bodies.map((r) => `## ${r.tag} (${relDate(r.published)})${r.name && r.name !== r.tag ? ` — ${r.name}` : ""}\n${r.body.trim()}`).join("\n\n");
+  } else if (res.commits && res.commits.subjects.length) {
+    res.notes = res.commits.subjects.join("\n");
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------- output ----
+
+function truncate(s, n) {
+  if (!s || s.length <= n) return s;
+  return `${s.slice(0, n).replace(/\s+\S*$/, "")}\n… [truncated, ${s.length - n} more chars]`;
+}
+
+function plural(n, word) {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+function jsonOut(results) {
+  const out = results.map((r) => ({
+    name: r.name,
+    installed: r.installed,
+    latest: r.latest,
+    outdated: r.outdated,
+    repo: r.repo,
+    npmUrl: r.npmUrl || null,
+    monorepo: r.monorepo,
+    versions: r.versions,
+    releases: r.releases.map((x) => ({ tag: x.tag, name: x.name, published: x.published, body: x.body })),
+    commits: r.commits,
+    error: r.error || null,
+  }));
+  console.log(JSON.stringify(out, null, 2));
+}
+
+function textOut(results) {
+  const outdated = results.filter((r) => r.outdated && r.error === null);
+  const upToDate = results.filter((r) => !r.outdated && r.error === null);
+  const failed = results.filter((r) => r.error !== null);
+
+  if (opts.all) {
+    console.log(`pi extension packages (${agentDir})\n`);
+    for (const r of results) {
+      if (r.error) {
+        console.log(`## ${r.name}  — error: ${r.error}`);
+      } else if (!r.outdated) {
+        console.log(`## ${r.name}\ninstalled: ${r.installed} — up to date`);
+      } else {
+        printPackage(r);
+      }
+    }
+  } else {
+    if (outdated.length) {
+      console.log(`pi extension updates — ${plural(outdated.length, "package")} with a newer version on npm (${agentDir})\n`);
+    } else {
+      console.log(`No pi extension updates (${agentDir})`);
+    }
+    for (const r of outdated) printPackage(r);
+    if (failed.length) {
+      console.log("\nCould not check:");
+      for (const r of failed) console.log(`- ${r.name}: ${r.error}`);
+    }
+  }
+}
+
+function printPackage(r) {
+  console.log(`## ${r.name}  ${r.installed} → ${r.latest}  (${r.repo || "no GitHub repo"})${r.monorepo ? " [monorepo]" : ""}`);
+  const range = r.versions.map((v) => `${v.version}${v.published ? ` (${relDate(v.published)})` : ""}`).join(", ");
+  if (range) console.log(`new versions: ${range}`);
+
+  if (r.notes) {
+    const body = opts.full ? r.notes : truncate(r.notes, opts.maxNotes);
+    console.log("");
+    console.log(body);
+  } else if (r.commits && r.commits.error) {
+    console.log(`\ncommit diff v${r.commits.base}..v${r.commits.head}: ${r.commits.error}`);
+  } else if (r.releases.length) {
+    console.log(`\n${r.releases.length} release(s) in range but no notes attached.`);
+  } else if (r.repo) {
+    console.log(`\nNo release notes or matching tags; see https://github.com/${r.repo}/releases`);
+  } else {
+    console.log(`\nNo release notes; see ${r.npmUrl}`);
+  }
+
+  if (r.commits && r.commits.subjects.length && opts.full) {
+    console.log(`\ncommits ${r.commits.base}..${r.commits.head} (${r.commits.ahead}):`);
+    console.log(r.commits.subjects.join("\n"));
+  }
+  console.log("");
+}
+
+// ------------------------------------------------------------------ main ----
+
+async function main() {
+  let pkgs = loadInstalled();
+  if (only.length) {
+    pkgs = pkgs.filter((p) => only.includes(p.name) || only.includes(p.name.replace(/^@[^/]+\//, "")));
+    const missing = only.filter((n) => !pkgs.some((p) => p.name === n));
+    if (missing.length) console.error(`not an installed pi package: ${missing.join(", ")}`);
+  }
+
+  // Count how many installed packages share each repo (monorepo detection).
+  const repoCount = {};
+  await Promise.all(
+    pkgs.map(async (p) => {
+      try {
+        const info = await npmInfo(p.name);
+        const slug = githubSlug(info.repoUrl);
+        if (slug) repoCount[`${slug.owner}/${slug.repo}`] = (repoCount[`${slug.owner}/${slug.repo}`] || 0) + 1;
+      } catch {
+        /* ignore */
+      }
+    })
+  );
+
+  const results = [];
+  const concurrency = 4;
+  for (let i = 0; i < pkgs.length; i += concurrency) {
+    const batch = pkgs.slice(i, i + concurrency);
+    const res = await Promise.all(batch.map((p) => analyze(p, { repoCount })));
+    results.push(...res);
+  }
+
+  if (opts.json) jsonOut(results);
+  else textOut(results);
+}
+
+main().catch((e) => {
+  console.error(`pi-extension-changelog: ${e.message}`);
+  process.exit(1);
+});

@@ -1,0 +1,17 @@
+{
+  "name": "pi-extension-changelog",
+  "version": "0.1.0",
+  "description": "Show what changed in pending pi extension package updates before running `pi update --extensions`.",
+  "keywords": ["pi-package", "pi-prompt", "changelog", "extension-updates", "update"],
+  "license": "MIT",
+  "bin": {
+    "pi-extension-changelog": "./pi-extension-changelog"
+  },
+  "files": ["pi-extension-changelog", "prompts"],
+  "pi": {
+    "prompts": ["./prompts"]
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
