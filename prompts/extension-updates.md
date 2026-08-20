@@ -37,5 +37,6 @@ changes for me before I decide whether to update. Scope: ${@:-all outdated packa
 4. If the output ends with a note that release notes were truncated, re-run
    with `--full` for those packages so nothing important is hidden.
 
-5. Finish by asking whether to proceed: `pi update --extensions` (everything),
-   `pi update --extension npm:<name>` (a single package), or skip for now.
+5. Finish by telling the user what to run: `pi update --extensions` to update
+   everything, or `pi update --extension npm:<name>` for a single package.
+   Don't ask whether to proceed.

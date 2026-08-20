@@ -17,8 +17,9 @@ In a pi session, type:
 ```
 
 The model then collects the data and summarizes per package (version bump,
-features/fixes, breaking or security-relevant changes), and asks whether to
-proceed with `pi update --extensions`.
+features/fixes, breaking or security-relevant changes), and ends by telling
+the user which update command to run (`pi update --extensions` or
+`pi update --extension npm:<name>`).
 
 Data collection uses the bundled `pi-extension-changelog` CLI when available
 (installed packages vs npm registry + GitHub release notes/commit diffs via
