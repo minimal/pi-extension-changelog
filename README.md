@@ -40,3 +40,9 @@ pi-extension-changelog --agent-dir DIR   # override ~/.pi/agent
 ```
 
 Requires Node >= 18 and `gh` on PATH.
+
+The default text output caps each package's release notes at `--max-notes`
+chars (default 5000) and ends with a note when anything is truncated — re-run
+with `--full` for the untruncated notes. `--json` output is never truncated.
+Identical release notes shared across packages from the same monorepo are
+printed once; the other packages point back to them.

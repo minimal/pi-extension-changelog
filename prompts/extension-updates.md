@@ -34,8 +34,8 @@ changes for me before I decide whether to update. Scope: ${@:-all outdated packa
    - If a package is part of a shared monorepo (multiple packages share one
      repo), say so — the diff spans the whole repo, not just that package.
 
-4. If the changelog output was truncated, re-run with `--full` for the package
-   in question so nothing important is hidden.
+4. If the output ends with a note that release notes were truncated, re-run
+   with `--full` for those packages so nothing important is hidden.
 
 5. Finish by asking whether to proceed: `pi update --extensions` (everything),
    `pi update --extension npm:<name>` (a single package), or skip for now.

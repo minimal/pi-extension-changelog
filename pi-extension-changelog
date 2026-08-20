@@ -331,40 +331,58 @@ function jsonOut(results) {
 
 function textOut(results) {
   const outdated = results.filter((r) => r.outdated && r.error === null);
-  const upToDate = results.filter((r) => !r.outdated && r.error === null);
   const failed = results.filter((r) => r.error !== null);
 
-  if (opts.all) {
-    console.log(`pi extension packages (${agentDir})\n`);
-    for (const r of results) {
+  // Print a list of packages. Identical release notes within a shared repo are
+  // printed once (first occurrence); later packages get a pointer instead.
+  // Returns how many printed packages' notes hit the default cap.
+  const printList = (rs, header) => {
+    if (header) console.log(header);
+    const seenNotes = new Map(); // "repo\0notes" -> first package name
+    let truncated = 0;
+    for (const r of rs) {
       if (r.error) {
         console.log(`## ${r.name}  — error: ${r.error}`);
       } else if (!r.outdated) {
         console.log(`## ${r.name}\ninstalled: ${r.installed} — up to date`);
       } else {
-        printPackage(r);
+        const key = r.notes ? `${r.repo}\u0000${r.notes}` : null;
+        const dup = key ? seenNotes.get(key) : null;
+        if (key && !dup) seenNotes.set(key, r.name);
+        printPackage(r, dup || null);
+        if (!dup && !opts.full && r.notes && r.notes.length > opts.maxNotes) truncated++;
       }
     }
+    return truncated;
+  };
+
+  let truncated = 0;
+  if (opts.all) {
+    truncated = printList(results, `pi extension packages (${agentDir})\n`);
+  } else if (outdated.length) {
+    truncated = printList(outdated, `pi extension updates — ${plural(outdated.length, "package")} with a newer version on npm (${agentDir})\n`);
   } else {
-    if (outdated.length) {
-      console.log(`pi extension updates — ${plural(outdated.length, "package")} with a newer version on npm (${agentDir})\n`);
-    } else {
-      console.log(`No pi extension updates (${agentDir})`);
-    }
-    for (const r of outdated) printPackage(r);
-    if (failed.length) {
-      console.log("\nCould not check:");
-      for (const r of failed) console.log(`- ${r.name}: ${r.error}`);
-    }
+    console.log(`No pi extension updates (${agentDir})`);
+  }
+
+  if (truncated) {
+    console.log(`\nNote: release notes truncated for ${plural(truncated, "package")} (default cap ${opts.maxNotes} chars). Re-run with --full for the full notes, or --json for untruncated machine-readable output.`);
+  }
+
+  if (failed.length) {
+    console.log("\nCould not check:");
+    for (const r of failed) console.log(`- ${r.name}: ${r.error}`);
   }
 }
 
-function printPackage(r) {
+function printPackage(r, dupOf) {
   console.log(`## ${r.name}  ${r.installed} → ${r.latest}  (${r.repo || "no GitHub repo"})${r.monorepo ? " [monorepo]" : ""}`);
   const range = r.versions.map((v) => `${v.version}${v.published ? ` (${relDate(v.published)})` : ""}`).join(", ");
   if (range) console.log(`new versions: ${range}`);
 
-  if (r.notes) {
+  if (dupOf) {
+    console.log(`\n(same release notes as ${dupOf} — shared ${r.repo} repo; see above)`);
+  } else if (r.notes) {
     const body = opts.full ? r.notes : truncate(r.notes, opts.maxNotes);
     console.log("");
     console.log(body);
